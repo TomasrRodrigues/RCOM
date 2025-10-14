@@ -187,12 +187,6 @@ int main(int argc, char *argv[])
                 STOP = TRUE;
             }
         }
-        /*
-        if (byte == 'z')
-        {
-            printf("Received 'z' char. Stop reading from serial port.\n");
-            STOP = TRUE;
-        }*/
     }
 
     if (STOP == FALSE){

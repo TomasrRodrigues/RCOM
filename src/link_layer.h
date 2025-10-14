@@ -1,6 +1,8 @@
 // Link layer header.
 // DO NOT CHANGE THIS FILE
 
+#include <stdint.h>
+
 #ifndef _LINK_LAYER_H_
 #define _LINK_LAYER_H_
 
@@ -18,6 +20,16 @@ typedef struct
     int nRetransmissions;
     int timeout;
 } LinkLayer;
+
+typedef enum {
+    START,
+    FLAG_RCV,
+    A_RCV,
+    C_RCV,
+    BCC_OK,
+    STOP_STATE
+} State;
+
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.
@@ -43,4 +55,8 @@ int llread(unsigned char *packet);
 // Return 0 on success or -1 on error.
 int llclose();
 
+
+int openSerialPort(const char *serialPort, int baudRate);
+void stateMachine (uint8_t byte);
+void alarmHandler(int signal);
 #endif // _LINK_LAYER_H_
