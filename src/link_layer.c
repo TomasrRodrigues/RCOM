@@ -13,13 +13,24 @@
 #include <unistd.h>
 #include <signal.h>
 #include "serial_port.h"
+
 // MISC
+
+
+
 #define _POSIX_SOURCE 1 // POSIX compliant source
-#define MAX_RETRIES 3
 #define FLAG 0x7E
 #define A 0x03
 #define C_SET 0x03
 #define C_UA 0x07
+
+#define ESC 0x7D
+#define C_I(seq) ((seq & 0x01) << 7)
+#define C_RR(nr) (0x05 | ((nr & 0x01) << 7)) 
+#define C_REJ(nr) (0x01 | ((nr & 0x01) << 7))
+
+static int gTimeout = 0;
+static int gRetries = 0;
 
 
 int alarmEnabled = FALSE;
@@ -84,12 +95,73 @@ void alarmHandler(int signal)
 }
 
 
-////////////////////////////////////////////////
+LlWriteState lw_state;
+uint8_t lw_areceived;
+uint8_t lw_creceived;
+
+void lw_reset_state() {
+    lw_state = WAIT_FLAG;
+    lw_areceived = 0;
+    lw_creceived = 0;
+}
+
+int lw_process_byte(uint8_t byte, int expected_seq)
+{
+    switch (lw_state) {
+        case WAIT_FLAG:
+            if (byte == FLAG) 
+                lw_state = WAIT_A;
+            break;
+        case WAIT_A:
+            if (byte == A) { 
+                lw_areceived = byte; 
+                lw_state = WAIT_C; 
+            }
+            else if (byte != FLAG) 
+                lw_state = WAIT_FLAG;
+            break;
+        case WAIT_C:
+            if (byte == C_RR(expected_seq) || byte == C_RR((expected_seq+1)%2)) { 
+                lw_creceived = byte; 
+                lw_state = WAIT_BCC; 
+            }
+            else if (byte == C_REJ(expected_seq) || byte == C_REJ((expected_seq+1)%2)) {
+                lw_creceived = byte; 
+                lw_state = WAIT_BCC;
+            }
+            else if (byte == FLAG) 
+                lw_state = WAIT_A;
+            else 
+                lw_state = WAIT_FLAG;
+            break;
+        case WAIT_BCC:
+            if (byte == (lw_areceived ^ lw_creceived)) 
+                lw_state = WAIT_STOP;
+            else if (byte == FLAG) 
+                lw_state = WAIT_A;
+            else 
+                lw_state = WAIT_FLAG;
+            break;
+        case WAIT_STOP:
+            if (byte == FLAG) {
+                if (lw_creceived == C_RR((expected_seq + 0) % 2) || lw_creceived == C_RR((expected_seq + 1) % 2))
+                    return 1; // RR
+                else if (lw_creceived == C_REJ((expected_seq + 0) % 2) || lw_creceived == C_REJ((expected_seq + 1) % 2))
+                    return 2; // REJ
+                lw_reset_state();
+            } else lw_state = WAIT_FLAG;
+            break;
+    }
+    return 0;
+}
+
+
+
 // LLOPEN
-////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters)
 {
-    // TODO: Implement this function
+    gTimeout = connectionParameters.timeout;
+    gRetries = connectionParameters.nRetransmissions;
 
     // Open Serial Port
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0){
@@ -112,7 +184,7 @@ int llopen(LinkLayer connectionParameters)
             exit(1);
         }
 
-        while (alarmCount < MAX_RETRIES && state != STOP_STATE)
+        while (alarmCount < connectionParameters.nRetransmissions && state != STOP_STATE)
         {
             // Read one byte from serial port.
             // NOTE: You must check how many bytes were actually read by reading the return value.
@@ -123,7 +195,7 @@ int llopen(LinkLayer connectionParameters)
                 writeBytesSerialPort(SET_frame, sizeof(SET_frame));
                 printf("SET sent (try #%d)\n", alarmCount + 1);
                 
-                alarm(3); 
+                alarm(connectionParameters.timeout); 
                 alarmEnabled = TRUE;
             }
 
@@ -135,7 +207,7 @@ int llopen(LinkLayer connectionParameters)
                 nBytesBuf += bytes;
                 stateMachine(byte);
 
-                printf("Byte received: %c\n", byte);
+                printf("Byte received: 0x%02X\n", byte);
                 if (state == STOP_STATE){ 
                     printf("Received STOP state. Ending reading.\n");
                     alarm(0);
@@ -179,15 +251,99 @@ int llopen(LinkLayer connectionParameters)
     return 0;
 }
 
-////////////////////////////////////////////////
+
+
+
+
 // LLWRITE
-////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    static int sequenceNumber = 0;
 
-    return 0;
+    unsigned char BCC2 = 0x00;
+    for (int i = 0; i < bufSize; i++)
+        BCC2 ^= buf[i];
+
+    // Build I Frame
+    unsigned char frame[2 * (bufSize + 6)];
+    int index = 4;
+    frame[0] = FLAG;
+    frame[1] = A;
+    frame[2] = C_I(sequenceNumber);
+    frame[3] = frame[1] ^ frame[2];
+
+    // Byte stuffing for DATA
+    for (int i = 0; i < bufSize; i++) {
+        if (buf[i] == FLAG) {
+            frame[index++] = ESC;
+            frame[index++] = 0x5E;
+        } else if (buf[i] == ESC) {
+            frame[index++] = ESC;
+            frame[index++] = 0x5D;
+        } else {
+            frame[index++] = buf[i];
+        }
+    }
+
+    // Byte stuffing for BCC2
+    if (BCC2 == FLAG) {
+        frame[index++] = ESC;
+        frame[index++] = 0x5E;
+    } else if (BCC2 == ESC) {
+        frame[index++] = ESC;
+        frame[index++] = 0x5D;
+    } else {
+        frame[index++] = BCC2;
+    }
+
+    frame[index++] = FLAG;
+
+    // Transmission variables
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+    lw_reset_state();
+
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1) {
+        perror("sigaction");
+        exit(1);
+    }
+
+
+    while (alarmCount < gRetries){
+        if (!alarmEnabled){
+            writeBytesSerialPort(frame, index);
+            printf("I-frame (seq=%d) sent, try #%d\n", sequenceNumber, alarmCount + 1);
+            alarm(gTimeout);
+            alarmEnabled = TRUE;
+        }
+
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+        if (bytes > 0) {
+            int result = lw_process_byte(byte, sequenceNumber);
+
+            if (result == 1){
+                printf("RR received. Frame accepted.\n");
+                alarm(0);
+                sequenceNumber = (sequenceNumber + 1) % 2;
+                return bufSize;
+            } else if (result == 2){
+                printf("REJ received. Retransmitting.\n");
+                alarm(0);
+                alarmEnabled = FALSE;
+            }
+        }
+    }
+
+    printf("Transmission failed after retries.\n");
+    return -1;
 }
+
+
+
+
 
 ////////////////////////////////////////////////
 // LLREAD

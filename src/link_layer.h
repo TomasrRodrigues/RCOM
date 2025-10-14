@@ -30,6 +30,8 @@ typedef enum {
     STOP_STATE
 } State;
 
+typedef enum {WAIT_FLAG, WAIT_A, WAIT_C, WAIT_BCC, WAIT_STOP} LlWriteState;
+
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.
