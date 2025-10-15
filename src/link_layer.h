@@ -32,6 +32,7 @@ typedef enum {
 
 typedef enum {WAIT_FLAG, WAIT_A, WAIT_C, WAIT_BCC, WAIT_STOP} LlWriteState;
 
+typedef enum {CLOSE_WAIT_FLAG, CLOSE_WAIT_A, CLOSE_WAIT_C, CLOSE_WAIT_BCC,CLOSE_WAIT_STOP} LlCloseState;
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.
@@ -61,4 +62,5 @@ int llclose();
 int openSerialPort(const char *serialPort, int baudRate);
 void stateMachine (uint8_t byte);
 void alarmHandler(int signal);
+int llclose_process_byte(LlCloseState *state, uint8_t byte);
 #endif // _LINK_LAYER_H_

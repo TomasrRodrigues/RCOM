@@ -12,7 +12,6 @@
 #include <termios.h>
 #include <unistd.h>
 #include <signal.h>
-#include "serial_port.h"
 
 // MISC
 
@@ -29,8 +28,11 @@
 #define C_RR(nr) (0x05 | ((nr & 0x01) << 7)) 
 #define C_REJ(nr) (0x01 | ((nr & 0x01) << 7))
 
+#define C_DISC 0x0B
+
 static int gTimeout = 0;
 static int gRetries = 0;
+static LinkLayer currentLayer;
 
 
 int alarmEnabled = FALSE;
@@ -156,10 +158,10 @@ int lw_process_byte(uint8_t byte, int expected_seq)
 }
 
 
-
 // LLOPEN
 int llopen(LinkLayer connectionParameters)
 {
+    currentLayer = connectionParameters;
     gTimeout = connectionParameters.timeout;
     gRetries = connectionParameters.nRetransmissions;
 
@@ -252,9 +254,6 @@ int llopen(LinkLayer connectionParameters)
 }
 
 
-
-
-
 // LLWRITE
 int llwrite(const unsigned char *buf, int bufSize)
 {
@@ -345,9 +344,8 @@ int llwrite(const unsigned char *buf, int bufSize)
 
 
 
-////////////////////////////////////////////////
+
 // LLREAD
-////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
     // TODO: Implement this function
@@ -355,14 +353,175 @@ int llread(unsigned char *packet)
     return 0;
 }
 
+
+
+
+
+
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
 int llclose()
 {
-    // TODO: Implement this function
 
+    unsigned char DISC_frame[] = {FLAG, A, C_DISC, A^C_DISC, FLAG};
+    unsigned char UA_frame[] = {FLAG, A, C_UA, A^C_UA, FLAG};
+
+    int res;
+    LlCloseState state = CLOSE_WAIT_FLAG;
+    unsigned char byte;
+
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        exit(1);
+    }
+
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+
+    if (currentLayer.role == LlTx){
+        printf("Transmitter: Sending DISC...\n");
+
+        while (alarmCount < gRetries){
+            if(!alarmEnabled){
+                writeBytesSerialPort(DISC_frame, sizeof(DISC_frame));
+                printf("DISC sent (try #%d)\n", alarmCount + 1);
+                alarm(gTimeout);
+                alarmEnabled = TRUE;
+            }
+
+            while (1) {
+                res = readByteSerialPort(&byte);
+                if (res < 0) { 
+                    perror("readByteSerialPort"); 
+                    return -1; }
+                if (res == 0) continue;
+
+                if(llclose_process_byte(&state, byte) > 0){
+                    printf("Transmitter: DISC frame received. Sending UA...\n");
+                    writeBytesSerialPort(UA_frame, sizeof(UA_frame));
+                    printf("UA sent. Closing connection.\n");
+                    alarm(0);
+                    closeSerialPort();
+                    return 0;
+                }
+            }
+        }
+
+        printf("Transmitter: Failed to receive DISC after retries. Closing connection.\n");
+        return -1;
+
+    }
+    else if (currentLayer.role == LlRx){
+        printf("Receiver: Waiting for DISC...\n");
+        state = CLOSE_WAIT_FLAG;
+
+        while (1) {
+            res = readByteSerialPort(&byte);
+            if (res < 0) { 
+                perror("readByteSerialPort"); 
+                closeSerialPort(); 
+                return -1; 
+            }
+            if (res == 0) continue;
+
+            if(llclose_process_byte(&state, byte))
+            {
+                printf("Receiver: DISC frame received. Sending DISC...\n");
+                writeBytesSerialPort(DISC_frame, sizeof(DISC_frame));
+                break;
+            }
+        }
+
+        alarmEnabled = FALSE;
+        alarmCount = 0;
+        state = CLOSE_WAIT_FLAG;
+        printf("Receiver: Waiting for UA...\n");
+
+
+        while (alarmCount < gRetries) {
+            if (!alarmEnabled) {
+                alarm(gTimeout);
+                alarmEnabled = TRUE;
+            }
+
+            res = readByteSerialPort(&byte);
+            if (res < 0) { 
+                perror("readByteSerialPort"); 
+                closeSerialPort(); 
+                return -1; 
+            }
+            if (res == 0) continue;
+
+            /* Now llclose_process_byte returns 2 for UA */
+            int rc = llclose_process_byte(&state, byte);
+            if (rc == 2) {
+                printf("Receiver: UA frame received. Closing connection.\n");
+                alarm(0);
+                closeSerialPort();
+                return 0;
+            }
+        }
+
+        printf("Receiver: Failed to receive UA. Closing connection.\n");
+        closeSerialPort();
+        return -1;
+    }
     return 0;
 }
 
 
+
+int llclose_process_byte(LlCloseState *state, uint8_t byte) {
+    // return: 0 if not complete, 1 if DISC received, 2 if UA received
+
+    static uint8_t matched_control = 0;
+
+    switch (*state){
+        case CLOSE_WAIT_FLAG:
+            if (byte == FLAG){
+                *state = CLOSE_WAIT_A;
+            }
+            break;
+        case CLOSE_WAIT_A:
+            if (byte == A){
+                *state = CLOSE_WAIT_C;
+            } else if (byte != FLAG){
+                *state = CLOSE_WAIT_FLAG;
+            }
+            break;
+        case CLOSE_WAIT_C:
+            if (byte == C_DISC || byte == C_UA){
+                matched_control = byte;
+                *state = CLOSE_WAIT_BCC;
+            } else if (byte == FLAG){
+                *state = CLOSE_WAIT_A;
+            } else {
+                *state = CLOSE_WAIT_FLAG;
+            }
+            break;
+        case CLOSE_WAIT_BCC:
+            if (matched_control!=0 && byte == (A ^ matched_control)){
+                *state = CLOSE_WAIT_STOP;
+            } else if (byte == FLAG){
+                *state = CLOSE_WAIT_A;
+            } else {
+                *state = CLOSE_WAIT_FLAG;
+            }
+            break;
+        case CLOSE_WAIT_STOP:
+            if (byte == FLAG){
+                if (matched_control == C_DISC)
+                    return 1;
+                else if (matched_control == C_UA)
+                    return 2;
+            } else {
+                *state = CLOSE_WAIT_FLAG;
+            }
+            break;
+    }
+    return 0;
+}
