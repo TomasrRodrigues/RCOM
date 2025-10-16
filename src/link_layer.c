@@ -24,7 +24,7 @@
 #define C_UA 0x07
 
 #define ESC 0x7D
-#define C_I(seq) ((seq & 0x01) << 7)
+#define C_I(seq) ((seq) ? 0x80 : 0x00)
 #define C_RR(nr) (0x05 | ((nr & 0x01) << 7)) 
 #define C_REJ(nr) (0x01 | ((nr & 0x01) << 7))
 
@@ -320,8 +320,9 @@ int llwrite(const unsigned char *buf, int bufSize)
 
         unsigned char byte;
         int bytes = readByteSerialPort(&byte);
+
         if (bytes > 0) {
-            int result = lw_process_byte(byte, sequenceNumber);
+            int result = lw_process_byte(byte, (sequenceNumber + 1) % 2);
 
             if (result == 1){
                 printf("RR received. Frame accepted.\n");
@@ -343,12 +344,106 @@ int llwrite(const unsigned char *buf, int bufSize)
 
 
 
-
-
 // LLREAD
 int llread(unsigned char *packet)
 {
-    // TODO: Implement this function
+    static int expected_seq = 0;
+    unsigned char frame[2048];
+    int index = 0;
+    unsigned char byte;
+    int res;
+
+    do {
+        res = readByteSerialPort(&byte);
+    } while (res > 0 && byte != FLAG);
+
+    while (1){
+        res = readByteSerialPort(&byte);
+        if (res <= 0) continue;
+
+        frame[index++] = byte;
+        if (byte == FLAG) break;
+        if (index >= sizeof(frame)) {
+            fprintf(stderr, "[llread] Frame too large\n");
+            break;
+        }
+    }
+
+    if (index < 6){
+        fprintf(stderr, "[llread] Frame too short\n");
+        return -1;
+    }
+
+    unsigned char A_r = frame[0];
+    unsigned char C_r = frame[1];
+    unsigned char BCC1 = frame[2];
+
+    if (BCC1 != (A_r ^ C_r)) {
+        fprintf(stderr, "[llread] Header BCC1 error (A=0x%02X, C=0x%02X)\n", A_r, C_r);
+        unsigned char rej[] = {FLAG, A, C_REJ(expected_seq), A ^ C_REJ(expected_seq), FLAG};
+        writeBytesSerialPort(rej, sizeof(rej));
+        return -1;
+    }
+
+    if (C_r != 0x00 && C_r != 0x80) {
+        fprintf(stderr, "[llread] Not an I frame (C=0x%02X)\n", C_r);
+        return -1;
+    }
+
+    int Ns = (C_r >> 7) & 0x01;
+
+
+    unsigned char destuffed[2048];
+    int destuffIndex = 0;
+    for (int i = 3; i < index - 1; i++) { // between BCC1 and last FLAG
+        if (frame[i] == ESC) {
+            i++;
+            if (i >= index - 1) break;
+            destuffed[destuffIndex++] = frame[i] ^ 0x20;
+        } else {
+            destuffed[destuffIndex++] = frame[i];
+        }
+    }
+
+    if (destuffIndex < 1) {
+        fprintf(stderr, "[llread] Empty frame after destuff\n");
+        return -1;
+    }
+
+    // --- Step 7: Separate DATA and BCC2 ---
+    unsigned char receivedBCC2 = destuffed[destuffIndex - 1];
+    unsigned char computedBCC2 = 0x00;
+    for (int i = 0; i < destuffIndex - 1; i++)
+        computedBCC2 ^= destuffed[i];
+
+    // --- Step 8: Check BCC2 integrity ---
+    if (receivedBCC2 != computedBCC2) {
+        fprintf(stderr, "[llread] Data BCC2 error (expected 0x%02X, got 0x%02X)\n",
+                computedBCC2, receivedBCC2);
+        unsigned char rej[] = {FLAG, A, C_REJ(expected_seq), A ^ C_REJ(expected_seq), FLAG};
+        writeBytesSerialPort(rej, sizeof(rej));
+        return -1;
+    }
+
+    // --- Step 9: Handle duplicates / correct frame ---
+    if (Ns == expected_seq) {
+        memcpy(packet, destuffed, destuffIndex - 1);
+        unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
+                              A ^ C_RR((expected_seq + 1) % 2), FLAG};
+        writeBytesSerialPort(rr, sizeof(rr));
+        printf("[llread] I-frame (Ns=%d) accepted, RR(%d) sent\n", Ns, (expected_seq + 1) % 2);
+        expected_seq = (expected_seq + 1) % 2;
+        return destuffIndex - 1;
+    } else {
+        // Duplicate frame
+        unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
+                              A ^ C_RR((expected_seq + 1) % 2), FLAG};
+        writeBytesSerialPort(rr, sizeof(rr));
+        printf("[llread] Duplicate I-frame (Ns=%d). RR resent.\n", Ns);
+        return 0; // no new data
+    }
+
+
 
     return 0;
 }
