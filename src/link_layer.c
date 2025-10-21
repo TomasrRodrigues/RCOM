@@ -30,6 +30,7 @@
 
 #define C_DISC 0x0B
 
+
 static int gTimeout = 0;
 static int gRetries = 0;
 static LinkLayer currentLayer;
@@ -265,11 +266,11 @@ int llwrite(const unsigned char *buf, int bufSize)
 
     // Build I Frame
     unsigned char frame[2 * (bufSize + 6)];
-    int index = 4;
-    frame[0] = FLAG;
-    frame[1] = A;
-    frame[2] = C_I(sequenceNumber);
-    frame[3] = frame[1] ^ frame[2];
+    int index = 0;
+    frame[index++] = FLAG;
+    frame[index++] = A;
+    frame[index++] = C_I(sequenceNumber);
+    frame[index++] = 0x03 ^ frame[2];
 
     // Byte stuffing for DATA
     for (int i = 0; i < bufSize; i++) {
@@ -369,10 +370,10 @@ int llread(unsigned char *packet)
         }
     }
 
-    if (index < 6){
+    /*if (index < 5){
         fprintf(stderr, "[llread] Frame too short\n");
-        return -1;
-    }
+        return 0;
+    }*/
 
     unsigned char A_r = frame[0];
     unsigned char C_r = frame[1];
@@ -410,13 +411,11 @@ int llread(unsigned char *packet)
         return -1;
     }
 
-    // --- Step 7: Separate DATA and BCC2 ---
     unsigned char receivedBCC2 = destuffed[destuffIndex - 1];
     unsigned char computedBCC2 = 0x00;
     for (int i = 0; i < destuffIndex - 1; i++)
         computedBCC2 ^= destuffed[i];
 
-    // --- Step 8: Check BCC2 integrity ---
     if (receivedBCC2 != computedBCC2) {
         fprintf(stderr, "[llread] Data BCC2 error (expected 0x%02X, got 0x%02X)\n",
                 computedBCC2, receivedBCC2);
@@ -425,7 +424,6 @@ int llread(unsigned char *packet)
         return -1;
     }
 
-    // --- Step 9: Handle duplicates / correct frame ---
     if (Ns == expected_seq) {
         memcpy(packet, destuffed, destuffIndex - 1);
         unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
@@ -435,12 +433,11 @@ int llread(unsigned char *packet)
         expected_seq = (expected_seq + 1) % 2;
         return destuffIndex - 1;
     } else {
-        // Duplicate frame
         unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
                               A ^ C_RR((expected_seq + 1) % 2), FLAG};
         writeBytesSerialPort(rr, sizeof(rr));
         printf("[llread] Duplicate I-frame (Ns=%d). RR resent.\n", Ns);
-        return 0; // no new data
+        return 0;
     }
 
 
@@ -489,7 +486,7 @@ int llclose()
 
             while (1) {
                 res = readByteSerialPort(&byte);
-                if (res < 0) { 
+                if (res < 0) {
                     perror("readByteSerialPort"); 
                     return -1; }
                 if (res == 0) continue;
