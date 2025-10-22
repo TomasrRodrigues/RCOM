@@ -97,6 +97,65 @@ void alarmHandler(int signal)
     printf("Alarm #%d received\n", alarmCount);
 }
 
+void alarmInit(){
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        exit(1);
+    }
+}
+
+static void sendSupervisionFrame(uint8_t control){
+    uint8_t frame[5];
+    frame[0] = FLAG;
+    frame[1] = A;
+    frame[2] = control;
+    frame[3] = A^control;
+    frame[4] = FLAG;
+    writeBytesSerialPort(frame, sizeof(frame));
+}
+
+static void sendRR(int nr){
+    uint8_t c = C_RR(nr);
+    sendSupervisionFrame(c);
+}
+
+static void sendREJ(int nr){
+    uint8_t c = C_REJ(nr);
+    sendSupervisionFrame(c);
+}
+
+static int stuffData(const unsigned char *input, int inputSize, unsigned char *output){
+    int index = 0;
+    for (int i = 0; i < inputSize; i++){
+        if (input[i] == FLAG){
+            output[index++] = ESC;
+            output[index++] = 0x5E;
+        } else if (input[i] == ESC){
+            output[index++] = ESC;
+            output[index++] = 0x5D;
+        } else {
+            output[index++] = input[i];
+        }
+    }
+    return index;
+}
+
+static int destuffData(const unsigned char *input, int inputSize, unsigned char *output){
+    int index = 0;
+    for (int i = 0; i < inputSize; i++){
+        if (input[i] == ESC){
+            i++;
+            if (i >= inputSize) break;
+            output[index++] = input[i] ^ 0x20;
+        } else {
+            output[index++] = input[i];
+        }
+    }
+    return index;
+}
 
 LlWriteState lw_state;
 uint8_t lw_areceived;
@@ -179,13 +238,7 @@ int llopen(LinkLayer connectionParameters)
         state = START;
         int nBytesBuf = 0;
 
-        struct sigaction act = {0};
-        act.sa_handler = &alarmHandler;
-        if (sigaction(SIGALRM, &act, NULL) == -1)
-        {
-            perror("sigaction");
-            exit(1);
-        }
+        alarmInit();
 
         while (alarmCount < connectionParameters.nRetransmissions && state != STOP_STATE)
         {
@@ -194,8 +247,7 @@ int llopen(LinkLayer connectionParameters)
             // In this example, we assume that the byte is always read, which may not be true.
             if (!alarmEnabled)
             {
-                unsigned char SET_frame[] = {FLAG, A, C_SET, A^C_SET, FLAG};
-                writeBytesSerialPort(SET_frame, sizeof(SET_frame));
+                sendSupervisionFrame(C_SET);
                 printf("SET sent (try #%d)\n", alarmCount + 1);
                 
                 alarm(connectionParameters.timeout); 
@@ -224,12 +276,7 @@ int llopen(LinkLayer connectionParameters)
         int nBytesBuf = 0;
 
         // Set up the alarm handler in case you want timeouts
-        struct sigaction act = {0};
-        act.sa_handler = &alarmHandler;
-        if (sigaction(SIGALRM, &act, NULL) == -1) {
-            perror("sigaction");
-            exit(1);
-        }
+        alarmInit();
 
         while (state != STOP_STATE) {
             unsigned char byte;
@@ -242,8 +289,7 @@ int llopen(LinkLayer connectionParameters)
 
                 if (state == STOP_STATE) {
                     // SET frame received correctly, send UA
-                    unsigned char UA_frame[] = {FLAG, A, C_UA, A^C_UA, FLAG};
-                    writeBytesSerialPort(UA_frame, sizeof(UA_frame));
+                    sendSupervisionFrame(C_UA);
                     printf("UA sent to transmitter\n");
                 }
             }
@@ -303,12 +349,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     alarmCount = 0;
     lw_reset_state();
 
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1) {
-        perror("sigaction");
-        exit(1);
-    }
+    alarmInit();
 
 
     while (alarmCount < gRetries){
@@ -381,8 +422,7 @@ int llread(unsigned char *packet)
 
     if (BCC1 != (A_r ^ C_r)) {
         fprintf(stderr, "[llread] Header BCC1 error (A=0x%02X, C=0x%02X)\n", A_r, C_r);
-        unsigned char rej[] = {FLAG, A, C_REJ(expected_seq), A ^ C_REJ(expected_seq), FLAG};
-        writeBytesSerialPort(rej, sizeof(rej));
+        sendREJ(expected_seq);
         return -1;
     }
 
@@ -419,23 +459,21 @@ int llread(unsigned char *packet)
     if (receivedBCC2 != computedBCC2) {
         fprintf(stderr, "[llread] Data BCC2 error (expected 0x%02X, got 0x%02X)\n",
                 computedBCC2, receivedBCC2);
-        unsigned char rej[] = {FLAG, A, C_REJ(expected_seq), A ^ C_REJ(expected_seq), FLAG};
-        writeBytesSerialPort(rej, sizeof(rej));
+        sendREJ(expected_seq);
         return -1;
     }
 
     if (Ns == expected_seq) {
         memcpy(packet, destuffed, destuffIndex - 1);
-        unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
-                              A ^ C_RR((expected_seq + 1) % 2), FLAG};
-        writeBytesSerialPort(rr, sizeof(rr));
+    
+        sendRR((expected_seq + 1) % 2);
+
         printf("[llread] I-frame (Ns=%d) accepted, RR(%d) sent\n", Ns, (expected_seq + 1) % 2);
         expected_seq = (expected_seq + 1) % 2;
+        
         return destuffIndex - 1;
     } else {
-        unsigned char rr[] = {FLAG, A, C_RR((expected_seq + 1) % 2),
-                              A ^ C_RR((expected_seq + 1) % 2), FLAG};
-        writeBytesSerialPort(rr, sizeof(rr));
+        sendRR(expected_seq);
         printf("[llread] Duplicate I-frame (Ns=%d). RR resent.\n", Ns);
         return 0;
     }
@@ -455,20 +493,11 @@ int llread(unsigned char *packet)
 int llclose()
 {
 
-    unsigned char DISC_frame[] = {FLAG, A, C_DISC, A^C_DISC, FLAG};
-    unsigned char UA_frame[] = {FLAG, A, C_UA, A^C_UA, FLAG};
-
     int res;
     LlCloseState state = CLOSE_WAIT_FLAG;
     unsigned char byte;
 
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1)
-    {
-        perror("sigaction");
-        exit(1);
-    }
+    alarmInit();
 
     alarmEnabled = FALSE;
     alarmCount = 0;
@@ -478,7 +507,7 @@ int llclose()
 
         while (alarmCount < gRetries){
             if(!alarmEnabled){
-                writeBytesSerialPort(DISC_frame, sizeof(DISC_frame));
+                sendSupervisionFrame(C_DISC);
                 printf("DISC sent (try #%d)\n", alarmCount + 1);
                 alarm(gTimeout);
                 alarmEnabled = TRUE;
@@ -493,7 +522,7 @@ int llclose()
 
                 if(llclose_process_byte(&state, byte) > 0){
                     printf("Transmitter: DISC frame received. Sending UA...\n");
-                    writeBytesSerialPort(UA_frame, sizeof(UA_frame));
+                    sendSupervisionFrame(C_UA);
                     printf("UA sent. Closing connection.\n");
                     alarm(0);
                     closeSerialPort();
@@ -522,7 +551,7 @@ int llclose()
             if(llclose_process_byte(&state, byte))
             {
                 printf("Receiver: DISC frame received. Sending DISC...\n");
-                writeBytesSerialPort(DISC_frame, sizeof(DISC_frame));
+                sendSupervisionFrame(C_DISC);
                 break;
             }
         }
