@@ -107,12 +107,23 @@ void alarmInit(){
     }
 }
 
+static unsigned char computeBCC1(unsigned char a, unsigned char c) {
+    return a ^ c;
+}
+
+static unsigned char computeBCC2(const unsigned char *data, int len) {
+    unsigned char bcc = 0;
+    for (int i = 0; i < len; i++)
+        bcc ^= data[i];
+    return bcc;
+}
+
 static void sendSupervisionFrame(uint8_t control){
     uint8_t frame[5];
     frame[0] = FLAG;
     frame[1] = A;
     frame[2] = control;
-    frame[3] = A^control;
+    frame[3] = computeBCC1(A, control);
     frame[4] = FLAG;
     writeBytesSerialPort(frame, sizeof(frame));
 }
@@ -306,9 +317,7 @@ int llwrite(const unsigned char *buf, int bufSize)
 {
     static int sequenceNumber = 0;
 
-    unsigned char BCC2 = 0x00;
-    for (int i = 0; i < bufSize; i++)
-        BCC2 ^= buf[i];
+    unsigned char BCC2 = computeBCC2(buf, bufSize);
 
     // Build I Frame
     unsigned char frame[2 * (bufSize + 6)];
@@ -316,31 +325,15 @@ int llwrite(const unsigned char *buf, int bufSize)
     frame[index++] = FLAG;
     frame[index++] = A;
     frame[index++] = C_I(sequenceNumber);
-    frame[index++] = 0x03 ^ frame[2];
+    frame[index++] = computeBCC1(A, frame[2]);
 
-    // Byte stuffing for DATA
-    for (int i = 0; i < bufSize; i++) {
-        if (buf[i] == FLAG) {
-            frame[index++] = ESC;
-            frame[index++] = 0x5E;
-        } else if (buf[i] == ESC) {
-            frame[index++] = ESC;
-            frame[index++] = 0x5D;
-        } else {
-            frame[index++] = buf[i];
-        }
-    }
+    // Byte stuffing for DATA + BCC2
+    unsigned char dataWithBCC2[bufSize + 1];
+    memcpy(dataWithBCC2, buf, bufSize);
+    dataWithBCC2[bufSize] = BCC2;
 
-    // Byte stuffing for BCC2
-    if (BCC2 == FLAG) {
-        frame[index++] = ESC;
-        frame[index++] = 0x5E;
-    } else if (BCC2 == ESC) {
-        frame[index++] = ESC;
-        frame[index++] = 0x5D;
-    } else {
-        frame[index++] = BCC2;
-    }
+    int stuffedLen = stuffData(dataWithBCC2, bufSize + 1, frame + index);
+    index += stuffedLen;
 
     frame[index++] = FLAG;
 
@@ -411,17 +404,13 @@ int llread(unsigned char *packet)
         }
     }
 
-    /*if (index < 5){
-        fprintf(stderr, "[llread] Frame too short\n");
-        return 0;
-    }*/
 
     unsigned char A_r = frame[0];
     unsigned char C_r = frame[1];
     unsigned char BCC1 = frame[2];
 
-    if (BCC1 != (A_r ^ C_r)) {
-        fprintf(stderr, "[llread] Header BCC1 error (A=0x%02X, C=0x%02X)\n", A_r, C_r);
+    if (BCC1 != computeBCC1(A_r, C_r)) {
+        fprintf(stderr, "[llread] Header BCC1 error\n");
         sendREJ(expected_seq);
         return -1;
     }
@@ -435,15 +424,11 @@ int llread(unsigned char *packet)
 
 
     unsigned char destuffed[2048];
-    int destuffIndex = 0;
-    for (int i = 3; i < index - 1; i++) { // between BCC1 and last FLAG
-        if (frame[i] == ESC) {
-            i++;
-            if (i >= index - 1) break;
-            destuffed[destuffIndex++] = frame[i] ^ 0x20;
-        } else {
-            destuffed[destuffIndex++] = frame[i];
-        }
+    int destuffIndex = destuffData(frame + 3, index - 4, destuffed); // skip A, C, BCC1 and final FLAG
+    if (destuffIndex < 0) {
+        fprintf(stderr, "[llread] Destuffing error\n");
+        sendREJ(expected_seq);
+        return -1;
     }
 
     if (destuffIndex < 1) {
@@ -452,9 +437,7 @@ int llread(unsigned char *packet)
     }
 
     unsigned char receivedBCC2 = destuffed[destuffIndex - 1];
-    unsigned char computedBCC2 = 0x00;
-    for (int i = 0; i < destuffIndex - 1; i++)
-        computedBCC2 ^= destuffed[i];
+    unsigned char computedBCC2 = computeBCC2(destuffed, destuffIndex - 1);
 
     if (receivedBCC2 != computedBCC2) {
         fprintf(stderr, "[llread] Data BCC2 error (expected 0x%02X, got 0x%02X)\n",
@@ -624,7 +607,7 @@ int llclose_process_byte(LlCloseState *state, uint8_t byte) {
             }
             break;
         case CLOSE_WAIT_BCC:
-            if (matched_control!=0 && byte == (A ^ matched_control)){
+            if (matched_control!=0 && byte == computeBCC1(A, matched_control)){
                 *state = CLOSE_WAIT_STOP;
             } else if (byte == FLAG){
                 *state = CLOSE_WAIT_A;
