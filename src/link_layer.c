@@ -18,19 +18,28 @@
 
 
 #define _POSIX_SOURCE 1 // POSIX compliant source
+
+
 #define FLAG 0x7E
 #define A 0x03
+
 #define C_SET 0x03
 #define C_UA 0x07
-
-#define ESC 0x7D
+#define C_DISC 0x0B
 #define C_I(seq) ((seq) ? 0x80 : 0x00)
 #define C_RR(nr) (0x05 | ((nr & 0x01) << 7)) 
 #define C_REJ(nr) (0x01 | ((nr & 0x01) << 7))
 
-#define C_DISC 0x0B
+#define ESC 0x7D
+#define ESC_FLAG 0x5E
+#define ESC_ESC 0x5D
 
+#define MIN_SUPERVISION_FRAME_SIZE 5
+#define MAX_FRAME_SIZE 2048
+#define FRAME_HEADER_SIZE 3
+#define FRAME_OVERHEAD 4
 
+#define MAX_STUFFED_SIZE(data_len) (2* ((data_len) + 6))
 static int gTimeout = 0;
 static int gRetries = 0;
 static LinkLayer currentLayer;
@@ -39,58 +48,74 @@ static LinkLayer currentLayer;
 int alarmEnabled = FALSE;
 int alarmCount = 0;
 
-uint8_t areceived;
-uint8_t creceived;
 
-State state = START;
-void stateMachine (uint8_t byte){
-    switch (state){
-        case START:
-            if (byte == FLAG){
-                state = FLAG_RCV;
-            }
-            break;
-        case FLAG_RCV:
-            if (byte == A){
-                areceived = byte;
-                state = A_RCV;
-            } else if (byte != FLAG){
-                state = START;
-            }
-            break;
-        case A_RCV:
-            if (byte == C_SET || byte == C_UA){
-                state = C_RCV;
-                creceived = byte;
-            } else if (byte == FLAG){
-                state = FLAG_RCV;
-            } else {
-                state = START;
-            }
-            break;    
-        case C_RCV:
-            if (byte == (areceived ^ creceived)){
-                state = BCC_OK;
-            } else if (byte == FLAG){
-                state = FLAG_RCV;
-            } else {
-                state = START;
-            }
-            break;
-        case BCC_OK:
-            if (byte == FLAG){
-                state = STOP_STATE;
-            } else {
-                state = START;
-            }
-            break;
-        case STOP_STATE:
-            break;
-    }
+// ============================================================================
+//  BCC HELPERS
+// ============================================================================
+
+static unsigned char computeBCC1(unsigned char a, unsigned char c) {
+    return a ^ c;
 }
 
-void alarmHandler(int signal)
-{
+static unsigned char computeBCC2(const unsigned char *data, int len) {
+    unsigned char bcc = 0;
+    for (int i = 0; i < len; i++)
+        bcc ^= data[i];
+    return bcc;
+}
+
+
+// ============================================================================
+// PARSER STATE MACHINE
+// ============================================================================
+
+static void resetParser(FrameParser *parser) {
+    parser->state = PARSE_WAIT_FLAG;
+    parser->receivedA = 0;
+    parser->receivedC = 0;
+}
+
+static int parseSupervisionFrame(FrameParser *parser, unsigned char byte){
+    switch (parser->state){
+        case PARSE_WAIT_FLAG:
+            if (byte == FLAG)
+                parser->state = PARSE_WAIT_A;
+            break;
+        case PARSE_WAIT_A:
+            if (byte == A){
+                parser->receivedA = byte;
+                parser->state = PARSE_WAIT_C;
+            } else if (byte != FLAG)
+                parser->state = PARSE_WAIT_FLAG;
+            break;
+        case PARSE_WAIT_C:
+            parser->receivedC = byte;
+            parser->state = PARSE_WAIT_BCC;
+            break;    
+        case PARSE_WAIT_BCC:
+            if (byte == computeBCC1(parser->receivedA, parser->receivedC))
+                parser->state = PARSE_WAIT_STOP;
+            else if (byte == FLAG)
+                parser->state = PARSE_WAIT_A;
+            else 
+                parser->state = PARSE_WAIT_FLAG;
+            break;
+        case PARSE_WAIT_STOP:
+            if (byte == FLAG){
+                return 1; // Frame received successfully
+            } else
+                parser->state = PARSE_WAIT_FLAG;
+            break;
+    }
+    return 0;
+}
+
+
+// ============================================================================
+// ALARM HANDLER AND RETRY LOGIC
+// ============================================================================
+
+void alarmHandler(int signal){
     alarmEnabled = FALSE;
     alarmCount++;
 
@@ -107,16 +132,28 @@ void alarmInit(){
     }
 }
 
-static unsigned char computeBCC1(unsigned char a, unsigned char c) {
-    return a ^ c;
+static void startRetryTimer(int timeout) {
+    alarm(timeout);
+    alarmEnabled = TRUE;
 }
 
-static unsigned char computeBCC2(const unsigned char *data, int len) {
-    unsigned char bcc = 0;
-    for (int i = 0; i < len; i++)
-        bcc ^= data[i];
-    return bcc;
+static void stopRetryTimer(void) {
+    alarm(0);
+    alarmEnabled = FALSE;
 }
+
+static void resetRetryState(void) {
+    alarmEnabled = FALSE;
+    alarmCount = 0;
+}
+
+static int canRetry(void) {
+    return alarmCount < gRetries;
+}
+
+// ============================================================================
+// FRAME HELPERS
+// ============================================================================
 
 static void sendSupervisionFrame(uint8_t control){
     uint8_t frame[5];
@@ -138,15 +175,20 @@ static void sendREJ(int nr){
     sendSupervisionFrame(c);
 }
 
+
+// ============================================================================
+// DATA STUFFING / DESTUFFING
+// ============================================================================
+
 static int stuffData(const unsigned char *input, int inputSize, unsigned char *output){
     int index = 0;
     for (int i = 0; i < inputSize; i++){
         if (input[i] == FLAG){
             output[index++] = ESC;
-            output[index++] = 0x5E;
+            output[index++] = ESC_FLAG;
         } else if (input[i] == ESC){
             output[index++] = ESC;
-            output[index++] = 0x5D;
+            output[index++] = ESC_ESC;
         } else {
             output[index++] = input[i];
         }
@@ -159,7 +201,7 @@ static int destuffData(const unsigned char *input, int inputSize, unsigned char 
     for (int i = 0; i < inputSize; i++){
         if (input[i] == ESC){
             i++;
-            if (i >= inputSize) break;
+            if (i >= inputSize) return -1; // Error: ESC at end of input
             output[index++] = input[i] ^ 0x20;
         } else {
             output[index++] = input[i];
@@ -168,75 +210,81 @@ static int destuffData(const unsigned char *input, int inputSize, unsigned char 
     return index;
 }
 
-LlWriteState lw_state;
-uint8_t lw_areceived;
-uint8_t lw_creceived;
 
-void lw_reset_state() {
-    lw_state = WAIT_FLAG;
-    lw_areceived = 0;
-    lw_creceived = 0;
+// ============================================================================
+// FRAME READING AND VALIDATION
+// ============================================================================
+
+static int readCompleteFrame(unsigned char *frame, int maxLen) {
+    unsigned char byte;
+    int res;
+    int index = 0;
+
+    // Wait for starting FLAG
+    do {
+        res = readByteSerialPort(&byte);
+        if (res < 0) return -1;
+    } while (res > 0 && byte != FLAG);
+
+    // Read until ending FLAG
+    while (1) {
+        res = readByteSerialPort(&byte);
+        if (res < 0) return -1;
+        if (res == 0) continue;
+
+        if (index < maxLen)
+            frame[index++] = byte;
+        else {
+            fprintf(stderr, "[readCompleteFrame] Frame too large\n");
+            return -1;
+        }
+
+        if (byte == FLAG) break;
+    }
+    return index;
 }
 
-int lw_process_byte(uint8_t byte, int expected_seq)
-{
-    switch (lw_state) {
-        case WAIT_FLAG:
-            if (byte == FLAG) 
-                lw_state = WAIT_A;
-            break;
-        case WAIT_A:
-            if (byte == A) { 
-                lw_areceived = byte; 
-                lw_state = WAIT_C; 
-            }
-            else if (byte != FLAG) 
-                lw_state = WAIT_FLAG;
-            break;
-        case WAIT_C:
-            if (byte == C_RR(expected_seq) || byte == C_RR((expected_seq+1)%2)) { 
-                lw_creceived = byte; 
-                lw_state = WAIT_BCC; 
-            }
-            else if (byte == C_REJ(expected_seq) || byte == C_REJ((expected_seq+1)%2)) {
-                lw_creceived = byte; 
-                lw_state = WAIT_BCC;
-            }
-            else if (byte == FLAG) 
-                lw_state = WAIT_A;
-            else 
-                lw_state = WAIT_FLAG;
-            break;
-        case WAIT_BCC:
-            if (byte == (lw_areceived ^ lw_creceived)) 
-                lw_state = WAIT_STOP;
-            else if (byte == FLAG) 
-                lw_state = WAIT_A;
-            else 
-                lw_state = WAIT_FLAG;
-            break;
-        case WAIT_STOP:
-            if (byte == FLAG) {
-                if (lw_creceived == C_RR((expected_seq + 0) % 2) || lw_creceived == C_RR((expected_seq + 1) % 2))
-                    return 1; // RR
-                else if (lw_creceived == C_REJ((expected_seq + 0) % 2) || lw_creceived == C_REJ((expected_seq + 1) % 2))
-                    return 2; // REJ
-                lw_reset_state();
-            } else lw_state = WAIT_FLAG;
-            break;
+static int validateIFrameHeader(unsigned char A_r, unsigned char C_r, unsigned char BCC1, int expected_seq) {
+    // Check BCC1
+    if (BCC1 != computeBCC1(A_r, C_r)) {
+        fprintf(stderr, "[llread] Header BCC1 error\n");
+        sendREJ(expected_seq);
+        return -1;
+    }
+
+    // Check if it's an I-frame (C must be 0x00 or 0x80)
+    if (C_r != 0x00 && C_r != 0x80) {
+        fprintf(stderr, "[llread] Not an I-frame (C=0x%02X)\n", C_r);
+        return -1;
+    }
+
+    // Extract and return sequence number
+    return (C_r >> 7) & 0x01;
+}
+
+static int validateBCC2(const unsigned char *data, int dataLen, unsigned char receivedBCC2) {
+    unsigned char computedBCC2 = computeBCC2(data, dataLen);
+    
+    if (receivedBCC2 != computedBCC2) {
+        fprintf(stderr, "[llread] BCC2 error: computed=0x%02X, received=0x%02X\n",
+                computedBCC2, receivedBCC2);
+        return -1;
     }
     return 0;
 }
 
 
+// ============================================================================
 // LLOPEN
+// ============================================================================
+
 int llopen(LinkLayer connectionParameters)
 {
     currentLayer = connectionParameters;
     gTimeout = connectionParameters.timeout;
     gRetries = connectionParameters.nRetransmissions;
 
-    // Open Serial Port
+    
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) < 0){
             perror("openSerialPort");
             return -1;
@@ -246,73 +294,69 @@ int llopen(LinkLayer connectionParameters)
 
     // If transmitter
     if (connectionParameters.role == LlTx){
-        state = START;
-        int nBytesBuf = 0;
+        FrameParser parser;
+        resetParser(&parser);
 
         alarmInit();
 
-        while (alarmCount < connectionParameters.nRetransmissions && state != STOP_STATE)
+        while (canRetry())
         {
-            // Read one byte from serial port.
-            // NOTE: You must check how many bytes were actually read by reading the return value.
-            // In this example, we assume that the byte is always read, which may not be true.
             if (!alarmEnabled)
             {
                 sendSupervisionFrame(C_SET);
                 printf("SET sent (try #%d)\n", alarmCount + 1);
-                
-                alarm(connectionParameters.timeout); 
-                alarmEnabled = TRUE;
+                startRetryTimer(gTimeout);
             }
-
 
             unsigned char byte;
             int bytes = readByteSerialPort(&byte);
             if (bytes > 0)
             {
-                nBytesBuf += bytes;
-                stateMachine(byte);
-
-                printf("Byte received: 0x%02X\n", byte);
-                if (state == STOP_STATE){ 
-                    printf("Received STOP state. Ending reading.\n");
-                    alarm(0);
+                
+                if(parseSupervisionFrame(&parser, byte) && parser.receivedC == C_UA){
+                    printf("UA frame received successfully.\n");
+                    stopRetryTimer();
+                    return 0;
                 }
             }
         }
 
-    }
-    else if (connectionParameters.role == LlRx){
-        state = START;
-        int nBytesBuf = 0;
+        printf("llopen Tx failed after retries.\n");
+        closeSerialPort();
+        return -1;
+    } else if (connectionParameters.role == LlRx){
+        FrameParser parser;
+        resetParser(&parser);
 
-        // Set up the alarm handler in case you want timeouts
+        // Set up the alarm handler 
         alarmInit();
 
-        while (state != STOP_STATE) {
+        while (1) {
             unsigned char byte;
             int bytes = readByteSerialPort(&byte);
             if (bytes > 0) {
-                nBytesBuf += bytes;
-                stateMachine(byte);
 
                 printf("Byte received: %02X\n", byte);
 
-                if (state == STOP_STATE) {
-                    // SET frame received correctly, send UA
-                    sendSupervisionFrame(C_UA);
-                    printf("UA sent to transmitter\n");
+                if (parseSupervisionFrame(&parser, byte)){
+                    if (parser.receivedC == C_SET){
+                        sendSupervisionFrame(C_UA);
+                        printf("SET received, UA sent to transmitter\n");
+                        return 0;
+                    }
+                    resetParser(&parser);
                 }
             }
         }
     }
-    else return -1;
-
-    return 0;
+    return -1;
 }
 
 
+// ============================================================================
 // LLWRITE
+// ============================================================================
+
 int llwrite(const unsigned char *buf, int bufSize)
 {
     static int sequenceNumber = 0;
@@ -320,7 +364,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     unsigned char BCC2 = computeBCC2(buf, bufSize);
 
     // Build I Frame
-    unsigned char frame[2 * (bufSize + 6)];
+    unsigned char frame[MAX_STUFFED_SIZE(bufSize)];
     int index = 0;
     frame[index++] = FLAG;
     frame[index++] = A;
@@ -337,38 +381,37 @@ int llwrite(const unsigned char *buf, int bufSize)
 
     frame[index++] = FLAG;
 
-    // Transmission variables
-    alarmEnabled = FALSE;
-    alarmCount = 0;
-    lw_reset_state();
+    resetRetryState();
 
+    FrameParser parser;
+    resetParser(&parser);
     alarmInit();
 
 
-    while (alarmCount < gRetries){
+    while (canRetry()){
         if (!alarmEnabled){
             writeBytesSerialPort(frame, index);
             printf("I-frame (seq=%d) sent, try #%d\n", sequenceNumber, alarmCount + 1);
-            alarm(gTimeout);
-            alarmEnabled = TRUE;
+            startRetryTimer(gTimeout);
         }
 
         unsigned char byte;
         int bytes = readByteSerialPort(&byte);
 
         if (bytes > 0) {
-            int result = lw_process_byte(byte, (sequenceNumber + 1) % 2);
-
-            if (result == 1){
-                printf("RR received. Frame accepted.\n");
-                alarm(0);
-                sequenceNumber = (sequenceNumber + 1) % 2;
-                return bufSize;
-            } else if (result == 2){
-                printf("REJ received. Retransmitting.\n");
-                alarm(0);
-                alarmEnabled = FALSE;
-            }
+            if (parseSupervisionFrame(&parser, byte)){
+                int expected = (sequenceNumber + 1) % 2;
+                if (parser.receivedC == C_RR(expected)){
+                    printf("RR received. Frame accepted.\n");
+                    stopRetryTimer();
+                    sequenceNumber = expected;
+                    return bufSize;
+                } else if (parser.receivedC == C_REJ(sequenceNumber % 2)){
+                    printf("REJ received. Retransmitting.\n");
+                    stopRetryTimer();
+                    resetParser(&parser);
+                }
+            } 
         }
     }
 
@@ -377,31 +420,20 @@ int llwrite(const unsigned char *buf, int bufSize)
 }
 
 
-
-
+// ============================================================================
 // LLREAD
+// ============================================================================
+
 int llread(unsigned char *packet)
 {
     static int expected_seq = 0;
-    unsigned char frame[2048];
-    int index = 0;
-    unsigned char byte;
-    int res;
+    unsigned char frame[MAX_FRAME_SIZE];
+    
 
-    do {
-        res = readByteSerialPort(&byte);
-    } while (res > 0 && byte != FLAG);
-
-    while (1){
-        res = readByteSerialPort(&byte);
-        if (res <= 0) continue;
-
-        frame[index++] = byte;
-        if (byte == FLAG) break;
-        if (index >= sizeof(frame)) {
-            fprintf(stderr, "[llread] Frame too large\n");
-            break;
-        }
+    int index = readCompleteFrame(frame, sizeof(frame));
+    if (index < MIN_SUPERVISION_FRAME_SIZE) {
+        fprintf(stderr, "[llread] Incomplete frame received\n");
+        return -1;
     }
 
 
@@ -409,22 +441,12 @@ int llread(unsigned char *packet)
     unsigned char C_r = frame[1];
     unsigned char BCC1 = frame[2];
 
-    if (BCC1 != computeBCC1(A_r, C_r)) {
-        fprintf(stderr, "[llread] Header BCC1 error\n");
-        sendREJ(expected_seq);
-        return -1;
-    }
-
-    if (C_r != 0x00 && C_r != 0x80) {
-        fprintf(stderr, "[llread] Not an I frame (C=0x%02X)\n", C_r);
-        return -1;
-    }
-
-    int Ns = (C_r >> 7) & 0x01;
+    int Ns = validateIFrameHeader(A_r, C_r, BCC1, expected_seq);
+    if (Ns < 0) return -1;
 
 
-    unsigned char destuffed[2048];
-    int destuffIndex = destuffData(frame + 3, index - 4, destuffed); // skip A, C, BCC1 and final FLAG
+    unsigned char destuffed[MAX_FRAME_SIZE];
+    int destuffIndex = destuffData(frame + FRAME_HEADER_SIZE, index - FRAME_OVERHEAD, destuffed); // skip A, C, BCC1 and final FLAG
     if (destuffIndex < 0) {
         fprintf(stderr, "[llread] Destuffing error\n");
         sendREJ(expected_seq);
@@ -437,11 +459,8 @@ int llread(unsigned char *packet)
     }
 
     unsigned char receivedBCC2 = destuffed[destuffIndex - 1];
-    unsigned char computedBCC2 = computeBCC2(destuffed, destuffIndex - 1);
-
-    if (receivedBCC2 != computedBCC2) {
-        fprintf(stderr, "[llread] Data BCC2 error (expected 0x%02X, got 0x%02X)\n",
-                computedBCC2, receivedBCC2);
+    
+    if (validateBCC2(destuffed, destuffIndex - 1, receivedBCC2) < 0) {
         sendREJ(expected_seq);
         return -1;
     }
@@ -461,53 +480,46 @@ int llread(unsigned char *packet)
         return 0;
     }
 
-
-
-    return 0;
 }
 
 
-
-
-
-
-
+// ============================================================================
 // LLCLOSE
+// ============================================================================
+
 int llclose()
 {
-
     int res;
-    LlCloseState state = CLOSE_WAIT_FLAG;
     unsigned char byte;
 
     alarmInit();
-
-    alarmEnabled = FALSE;
-    alarmCount = 0;
+    resetRetryState();
 
     if (currentLayer.role == LlTx){
         printf("Transmitter: Sending DISC...\n");
+        FrameParser parser;
+        resetParser(&parser);
 
-        while (alarmCount < gRetries){
+        while (canRetry()){
             if(!alarmEnabled){
                 sendSupervisionFrame(C_DISC);
                 printf("DISC sent (try #%d)\n", alarmCount + 1);
-                alarm(gTimeout);
-                alarmEnabled = TRUE;
+                startRetryTimer(gTimeout);
             }
 
             while (1) {
                 res = readByteSerialPort(&byte);
                 if (res < 0) {
                     perror("readByteSerialPort"); 
+                    closeSerialPort();
                     return -1; }
                 if (res == 0) continue;
 
-                if(llclose_process_byte(&state, byte) > 0){
+                if(parseSupervisionFrame(&parser, byte) && parser.receivedC == C_DISC){
                     printf("Transmitter: DISC frame received. Sending UA...\n");
                     sendSupervisionFrame(C_UA);
                     printf("UA sent. Closing connection.\n");
-                    alarm(0);
+                    stopRetryTimer();
                     closeSerialPort();
                     return 0;
                 }
@@ -515,12 +527,14 @@ int llclose()
         }
 
         printf("Transmitter: Failed to receive DISC after retries. Closing connection.\n");
+        closeSerialPort();
         return -1;
 
     }
     else if (currentLayer.role == LlRx){
         printf("Receiver: Waiting for DISC...\n");
-        state = CLOSE_WAIT_FLAG;
+        FrameParser parser;
+        resetParser(&parser);
 
         while (1) {
             res = readByteSerialPort(&byte);
@@ -531,7 +545,7 @@ int llclose()
             }
             if (res == 0) continue;
 
-            if(llclose_process_byte(&state, byte))
+            if(parseSupervisionFrame(&parser, byte) && parser.receivedC == C_DISC)
             {
                 printf("Receiver: DISC frame received. Sending DISC...\n");
                 sendSupervisionFrame(C_DISC);
@@ -539,16 +553,14 @@ int llclose()
             }
         }
 
-        alarmEnabled = FALSE;
-        alarmCount = 0;
-        state = CLOSE_WAIT_FLAG;
+        resetRetryState();
+        resetParser(&parser);
         printf("Receiver: Waiting for UA...\n");
 
 
-        while (alarmCount < gRetries) {
+        while (canRetry()) {
             if (!alarmEnabled) {
-                alarm(gTimeout);
-                alarmEnabled = TRUE;
+                startRetryTimer(gTimeout);
             }
 
             res = readByteSerialPort(&byte);
@@ -559,11 +571,10 @@ int llclose()
             }
             if (res == 0) continue;
 
-            /* Now llclose_process_byte returns 2 for UA */
-            int rc = llclose_process_byte(&state, byte);
-            if (rc == 2) {
+
+            if (parseSupervisionFrame(&parser, byte) && parser.receivedC == C_UA) {
                 printf("Receiver: UA frame received. Closing connection.\n");
-                alarm(0);
+                stopRetryTimer();
                 closeSerialPort();
                 return 0;
             }
@@ -576,55 +587,3 @@ int llclose()
     return 0;
 }
 
-
-
-int llclose_process_byte(LlCloseState *state, uint8_t byte) {
-    // return: 0 if not complete, 1 if DISC received, 2 if UA received
-
-    static uint8_t matched_control = 0;
-
-    switch (*state){
-        case CLOSE_WAIT_FLAG:
-            if (byte == FLAG){
-                *state = CLOSE_WAIT_A;
-            }
-            break;
-        case CLOSE_WAIT_A:
-            if (byte == A){
-                *state = CLOSE_WAIT_C;
-            } else if (byte != FLAG){
-                *state = CLOSE_WAIT_FLAG;
-            }
-            break;
-        case CLOSE_WAIT_C:
-            if (byte == C_DISC || byte == C_UA){
-                matched_control = byte;
-                *state = CLOSE_WAIT_BCC;
-            } else if (byte == FLAG){
-                *state = CLOSE_WAIT_A;
-            } else {
-                *state = CLOSE_WAIT_FLAG;
-            }
-            break;
-        case CLOSE_WAIT_BCC:
-            if (matched_control!=0 && byte == computeBCC1(A, matched_control)){
-                *state = CLOSE_WAIT_STOP;
-            } else if (byte == FLAG){
-                *state = CLOSE_WAIT_A;
-            } else {
-                *state = CLOSE_WAIT_FLAG;
-            }
-            break;
-        case CLOSE_WAIT_STOP:
-            if (byte == FLAG){
-                if (matched_control == C_DISC)
-                    return 1;
-                else if (matched_control == C_UA)
-                    return 2;
-            } else {
-                *state = CLOSE_WAIT_FLAG;
-            }
-            break;
-    }
-    return 0;
-}

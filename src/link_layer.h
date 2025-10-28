@@ -21,18 +21,20 @@ typedef struct
     int timeout;
 } LinkLayer;
 
+
 typedef enum {
-    START,
-    FLAG_RCV,
-    A_RCV,
-    C_RCV,
-    BCC_OK,
-    STOP_STATE
-} State;
+    PARSE_WAIT_FLAG,
+    PARSE_WAIT_A,
+    PARSE_WAIT_C,
+    PARSE_WAIT_BCC,
+    PARSE_WAIT_STOP
+} ParseState;
 
-typedef enum {WAIT_FLAG, WAIT_A, WAIT_C, WAIT_BCC, WAIT_STOP} LlWriteState;
-
-typedef enum {CLOSE_WAIT_FLAG, CLOSE_WAIT_A, CLOSE_WAIT_C, CLOSE_WAIT_BCC,CLOSE_WAIT_STOP} LlCloseState;
+typedef struct {
+    ParseState state;
+    unsigned char receivedA;
+    unsigned char receivedC;
+} FrameParser;
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.
@@ -60,7 +62,6 @@ int llclose();
 
 
 int openSerialPort(const char *serialPort, int baudRate);
-void stateMachine (uint8_t byte);
 void alarmHandler(int signal);
-int llclose_process_byte(LlCloseState *state, uint8_t byte);
+
 #endif // _LINK_LAYER_H_
